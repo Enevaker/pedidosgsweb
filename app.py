@@ -1,13 +1,14 @@
-
 import os, sqlite3, json, io
-from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, session, flash, send_file, abort, g
+from datetime import datetime, timedelta
+from flask import (
+    Flask, render_template, request, redirect, url_for, session,
+    flash, send_file, send_from_directory, abort, g
+)
 from werkzeug.security import generate_password_hash, check_password_hash
-
-
+from jinja2 import TemplateNotFound
 import secrets
-from datetime import timedelta
 
+# ------------ Utilidades ------------
 def generate_token(n=32):
     return secrets.token_urlsafe(n)[:n]
 
@@ -73,10 +74,12 @@ def migrate_db():
             db.execute(f"ALTER TABLE pedidos ADD COLUMN {col} {ctype}")
             db.commit()
 
-app = Flask(__name__)
+# ------------ App Flask ------------
+app = Flask(__name__, template_folder="templates", static_folder="static")
 app.secret_key = os.getenv("SECRET_KEY", "dev_secret_change_me")
 app.teardown_appcontext(close_db)
 
+# ------------ Helpers SQL ------------
 def query_one(q, args=()):
     return get_db().execute(q, args).fetchone()
 
@@ -89,6 +92,7 @@ def execute(q, args=()):
     db.commit()
     return cur.lastrowid
 
+# ------------ Auth decorators ------------
 def login_required(fn):
     from functools import wraps
     @wraps(fn)
@@ -112,6 +116,7 @@ def role_required(*roles):
         return wrapper
     return deco
 
+# ------------ Bootstrap BD / tablas ------------
 def ensure_db():
     first_time = not os.path.exists(DB_PATH)
 
@@ -170,7 +175,6 @@ def ensure_db():
         # ignorar si la BD está bloqueada u otra condición no crítica
         pass
 
-
 @app.before_request
 def _before():
     ensure_db()
@@ -179,6 +183,16 @@ def _before():
 def inject_now():
     return {"now": datetime.utcnow()}
 
+# ------------ Favicon (evita errores 404 en logs) ------------
+@app.get("/favicon.ico")
+def favicon():
+    ico_path = os.path.join(app.static_folder or "static", "favicon.ico")
+    if os.path.exists(ico_path):
+        return send_from_directory(app.static_folder, "favicon.ico", mimetype="image/vnd.microsoft.icon")
+    # sin archivo → no error
+    return ("", 204)
+
+# ------------ Rutas principales ------------
 @app.get("/")
 def home():
     if not session.get("user_id"):
@@ -210,11 +224,9 @@ def login():
 
 @app.get("/signup")
 def signup_form():
-    # Solo mostrar si no hay sesión iniciada
     if session.get("user_id"):
         return redirect(url_for("home"))
     return render_template("signup.html")
-
 
 @app.post("/signup")
 def signup_submit():
@@ -357,6 +369,9 @@ def pedido_pdf(pedido_id):
         except Exception: return []
     ninas = parse(p["ninas_json"]); ninos = parse(p["ninos_json"]); fechas = parse(p["fechas_entrega"] or "[]")
     buffer = io.BytesIO()
+    # PDF
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
     c = canvas.Canvas(buffer, pagesize=letter)
     width, height = letter
     y = height - 40
@@ -369,7 +384,6 @@ def pedido_pdf(pedido_id):
     c.drawString(40, y, f"Calceta niñas: {p['color_calceta_ninas'] or '—'}  Zapato niñas: {p['color_zapato_ninas'] or '—'}  Zapato niños: {p['color_zapato_ninos'] or '—'}"); y -= 14
     c.drawString(40, y, f"Moños: {p['color_monos'] or '—'}  Pantalón: {p['color_pantalon'] or '—'}  Escudos por bordar: {p['escudos_bordar'] or '—'}"); y -= 14
     c.drawString(40, y, f"Fechas de entrega: {', '.join(fechas) if fechas else '—'}"); y -= 20
-
     def draw_group(title, arr):
         nonlocal y
         c.setFont("Helvetica-Bold", 12); c.drawString(40, y, title); y -= 16; c.setFont("Helvetica", 10)
@@ -378,12 +392,10 @@ def pedido_pdf(pedido_id):
             y -= 14
             if y < 60: c.showPage(); y = height - 40
     draw_group("Niñas", ninas); y -= 8; draw_group("Niños", ninos)
-
     y -= 8; c.setFont("Helvetica-Bold", 12); c.drawString(40, y, "Comentarios"); y -= 16; c.setFont("Helvetica", 10)
     for line in (p["comentario"] or "").splitlines():
         c.drawString(50, y, line[:100]); y -= 14
         if y < 60: c.showPage(); y = height - 40
-
     c.showPage(); c.save(); buffer.seek(0)
     return send_file(buffer, mimetype="application/pdf", as_attachment=True, download_name=f"pedido_{pedido_id}.pdf")
 
@@ -444,10 +456,8 @@ def escuela_perfil_guardar():
 @role_required("escuela")
 def pedido_nuevo():
     esc = query_one("SELECT * FROM escuelas WHERE user_id=?", (session["user_id"],))
-    # fechas sugeridas del ejemplo
     fechas = ["25/05/2026","15/06/2026","29/06/2026","06/07/2026","13/07/2026"]
     return render_template("pedido_form.html", esc=esc, fechas=fechas)
-
 
 @app.post("/escuela/pedido/nuevo")
 @login_required
@@ -500,6 +510,7 @@ def pedido_guardar():
     ))
     flash("Pedido registrado correctamente.", "ok")
     return redirect(url_for("escuela_dashboard"))
+
 # ---------- Paqueterías (Admin) ----------
 @app.get("/admin/paqueterias")
 @login_required
@@ -527,19 +538,33 @@ def admin_paq_estado(paq_id):
     flash("Paquetería actualizada.", "ok")
     return redirect(url_for("admin_paqueterias"))
 
+# ---------- Manejo de errores robusto ----------
 @app.errorhandler(404)
 def _404(e):
-    return render_template("error.html", code=404, msg="No encontrado"), 404
+    try:
+        back = request.referrer or url_for("login")
+        return render_template("error.html", code=404, msg="No encontrado", description=str(e), back_url=back), 404
+    except TemplateNotFound:
+        return "404 - No encontrado", 404
 
 @app.errorhandler(403)
 def _403(e):
-    return render_template("error.html", code=403, msg="Acceso prohibido"), 403
+    try:
+        back = request.referrer or url_for("login")
+        return render_template("error.html", code=403, msg="Acceso prohibido", description=str(e), back_url=back), 403
+    except TemplateNotFound:
+        return "403 - Acceso prohibido", 403
 
 @app.errorhandler(500)
 def _500(e):
-    return render_template("error.html", code=500, msg="Error del servidor"), 500
+    app.logger.exception("Error 500: %s", e)
+    try:
+        back = request.referrer or url_for("login")
+        return render_template("error.html", code=500, msg="Error del servidor", description=str(e), back_url=back), 500
+    except TemplateNotFound:
+        return "500 - Error del servidor", 500
 
-
+# ---------- Admin: validar/gestionar escuelas ----------
 @app.get("/admin/validar_cuentas")
 @login_required
 @role_required("admin")
@@ -573,53 +598,6 @@ def admin_validar_accion(user_id, action):
     else:
         flash("Acción inválida.", "error")
     return redirect(url_for("admin_validar_cuentas"))
-
-
-
-@app.route("/forgot", methods=["GET","POST"])
-def forgot_password():
-    if request.method == "POST":
-        email = request.form.get("email","").strip().lower()
-        user = query_one("SELECT * FROM users WHERE email = ? AND role='escuela'", (email,))
-        if not user:
-            flash("Si existe una cuenta vinculada, se ha enviado un enlace de restablecimiento (simulado).", "ok")
-            return redirect(url_for("login"))
-        token = generate_token(48)
-        expires = (datetime.utcnow() + timedelta(hours=2)).isoformat()
-        execute("INSERT INTO password_resets(user_id, token, expires_at, created_at) VALUES (?,?,?,?)",
-                (user["id"], token, expires, datetime.utcnow().isoformat()))
-        # Show a simulated email page with the reset link (no SMTP required)
-        reset_link = url_for("reset_password", token=token, _external=True)
-        return render_template("forgot_sent.html", reset_link=reset_link, email=email)
-    return render_template("forgot.html")
-
-
-@app.route("/reset/<token>", methods=["GET","POST"])
-def reset_password(token):
-    pr = query_one("SELECT * FROM password_resets WHERE token = ?", (token,))
-    if not pr:
-        flash("Token inválido o expirado.", "error")
-        return redirect(url_for("login"))
-    # check expiry
-    try:
-        if datetime.fromisoformat(pr["expires_at"]) < datetime.utcnow():
-            flash("Token expirado.", "error")
-            return redirect(url_for("login"))
-    except Exception:
-        pass
-    if request.method == "POST":
-        pw = request.form.get("password","")
-        if not pw or len(pw) < 6:
-            flash("La contraseña debe tener al menos 6 caracteres.", "error")
-            return render_template("reset_form.html", token=token)
-        execute("UPDATE users SET password_hash = ? WHERE id = ?", (generate_password_hash(pw), pr["user_id"]))
-        # delete token
-        execute("DELETE FROM password_resets WHERE id = ?", (pr["id"],))
-        flash("Contraseña restablecida. Ya puedes iniciar sesión.", "ok")
-        return redirect(url_for("login"))
-    return render_template("reset_form.html", token=token)
-
-
 
 @app.get("/admin/schools")
 @login_required
@@ -661,7 +639,6 @@ def admin_edit_school_submit(escuela_id):
     flash("Datos de la escuela actualizados.", "ok")
     return redirect(url_for("admin_manage_schools"))
 
-
 @app.post("/admin/school/<int:escuela_id>/toggle")
 @login_required
 @role_required("admin")
@@ -682,13 +659,9 @@ def admin_delete_school(escuela_id):
     if not esc:
         abort(404)
     execute("DELETE FROM users WHERE id = ?", (esc["user_id"],))
-    # cascades should remove escuelas and related pedidos due to FK, but ensure deletion
     execute("DELETE FROM escuelas WHERE id = ?", (escuela_id,))
     flash("Escuela eliminada.", "ok")
     return redirect(url_for("admin_manage_schools"))
 
-
 if __name__ == "__main__":
     app.run(debug=True)
-
-
